@@ -1,0 +1,360 @@
+//@version=6
+strategy("Gold Breakout 15M Strategy", shorttitle="Gold Breakout 15M", overlay=true,
+     pyramiding=0, initial_capital=10000, max_boxes_count=500, max_lines_count=500, max_labels_count=500,
+     commission_type=strategy.commission.cash_per_order, commission_value=0.4, slippage=0,
+     margin_long=0, margin_short=0,
+     calc_on_every_tick=false, process_orders_on_close=false, fill_orders_on_standard_ohlc=true)
+
+// ═════════════════════════ INPUTS ═════════════════════════
+g1 = "Main Settings"
+timeMode   = input.string("Fixed timezone", "Broker Time Mode", options=["Fixed timezone", "New York + 7h"], group=g1)
+brokerTz   = input.string("GMT+3", "Broker Timezone", group=g1, tooltip="Folosit doar in modul Fixed timezone")
+rangeStart = input.int(0, "Range Start Hour", minval=0, maxval=23, group=g1)
+rangeEnd   = input.int(7, "Range End / Trading Start Hour", minval=1, maxval=23, group=g1)
+closeHour  = input.int(20, "Close All Positions Hour", minval=1, maxval=23, group=g1)
+
+g2 = "Risk Management"
+slMode     = input.string("% of entry", "SL Mode", options=["% of entry", "Range boundary"], group=g2)
+slPct      = input.float(0.7, "SL, % of Entry Price", minval=0.01, step=0.1, group=g2)
+tpOn       = input.bool(true, "Use Take Profit (R multiple)", group=g2)
+tpRR       = input.float(2.7, "Take Profit, R multiple", minval=0.1, step=0.1, group=g2)
+sizeMode   = input.string("% equity at risk", "Position Size Mode", options=["% equity at risk", "Fixed quantity"], group=g2)
+riskPct    = input.float(1.0, "Risk per Trade, % of Equity", minval=0.01, step=0.1, group=g2)
+fixedQty   = input.float(1.0, "Fixed Quantity", minval=0.0001, group=g2)
+ozPerLotIn = input.float(0.0, "Ounces per Lot (0 = auto)", minval=0, group=g2)
+maxLev     = input.float(10.0, "Max Leverage", minval=0.1, group=g2)
+qtyStepIn  = input.float(0.0, "Quantity Step (0 = auto)", minval=0, group=g2)
+fxManual   = input.float(1.0, "FX cont -> moneda simbolului (1 = aceeasi moneda)", minval=0.0001, group=g2)
+guardOn    = input.bool(false, "Prop Firm Guard (daily equity drawdown stop)", group=g2)
+guardLimit = input.float(4.0, "Max Drawdown from Daily Equity Peak, %", minval=0.1, step=0.1, group=g2)
+
+g3 = "Visual"
+showDash   = input.bool(true, "Show Dashboard", group=g3)
+showBoxes  = input.bool(true, "Show SL / TP Boxes", group=g3)
+extendLines = input.bool(true, "Extend range lines to Close Hour", group=g3)
+cBull      = input.color(color.new(#26a69a, 0), "Bull", group=g3)
+cBear      = input.color(color.new(#ef5350, 0), "Bear", group=g3)
+cRange     = input.color(color.new(#2962ff, 0), "Range", group=g3)
+cSL        = input.color(color.new(#ef5350, 0), "Stop Loss box", group=g3)
+cTP        = input.color(color.new(#26a69a, 0), "Take Profit box", group=g3)
+
+g4 = "Alerts"
+alertsOn   = input.bool(true, "Enable Alert Messages", group=g4)
+jsonOn     = input.bool(false, "Webhook JSON Format (off = text templates)", group=g4)
+secret     = input.string("SECRET_AICI", "Bot Secret", group=g4)
+previewOn  = input.bool(false, "Preview Messages in Pine Logs", group=g4)
+
+tJLE = input.text_area('{"strategy":"Gold Breakout 15M","event":"entry","action":"{{action}}","side":"{{side}}","ticker":"{{ticker}}","price":{{price}},"sl":{{sl}},"qty":{{qty}},"lots":{{lots}},"risk_usd":{{risk_usd}},"range_high":{{range_high}},"range_low":{{range_low}},"secret":"{{secret}}"}', "JSON · Long Entry", group=g4)
+tJSE = input.text_area('{"strategy":"Gold Breakout 15M","event":"entry","action":"{{action}}","side":"{{side}}","ticker":"{{ticker}}","price":{{price}},"sl":{{sl}},"qty":{{qty}},"lots":{{lots}},"risk_usd":{{risk_usd}},"range_high":{{range_high}},"range_low":{{range_low}},"secret":"{{secret}}"}', "JSON · Short Entry", group=g4)
+tJLX = input.text_area('{"strategy":"Gold Breakout 15M","event":"exit","action":"{{action}}","side":"{{side}}","ticker":"{{ticker}}","reason":"{{reason}}","price":{{price}},"qty":{{qty}},"secret":"{{secret}}"}', "JSON · Long Exit", group=g4)
+tJSX = input.text_area('{"strategy":"Gold Breakout 15M","event":"exit","action":"{{action}}","side":"{{side}}","ticker":"{{ticker}}","reason":"{{reason}}","price":{{price}},"qty":{{qty}},"secret":"{{secret}}"}', "JSON · Short Exit", group=g4)
+
+tTLE = input.text_area("🟢 BUY | {{tickerid}} | TF: {{interval}} | Price: {{price}} | SL: {{sl}} | Qty: {{qty}} ({{lots}} lots) | Risk: {{risk_usd}}", "Text · Long Entry", group=g4)
+tTSE = input.text_area("🔴 SELL | {{tickerid}} | TF: {{interval}} | Price: {{price}} | SL: {{sl}} | Qty: {{qty}} ({{lots}} lots) | Risk: {{risk_usd}}", "Text · Short Entry", group=g4)
+tTLX = input.text_area("⚪ EXIT LONG | {{tickerid}} | TF: {{interval}} | Price: {{price}} | Reason: {{reason}} | Qty: {{qty}}", "Text · Long Exit", group=g4)
+tTSX = input.text_area("⚪ EXIT SHORT | {{tickerid}} | TF: {{interval}} | Price: {{price}} | Reason: {{reason}} | Qty: {{qty}}", "Text · Short Exit", group=g4)
+
+idL = "RB long"
+idS = "RB short"
+
+// ═════════════════════════ BROKER CLOCK ═════════════════════════
+isNY   = timeMode == "New York + 7h"
+tzUse  = isNY ? "America/New_York" : brokerTz
+nyh    = hour(time, "America/New_York")
+bh     = isNY ? (nyh + 7) % 24 : hour(time, brokerTz)
+nyhNx  = hour(time_close, "America/New_York")
+nbh    = isNY ? (nyhNx + 7) % 24 : hour(time_close, brokerTz)   // ora de deschidere a barei urmatoare
+
+dayBase = math.floor(timestamp(tzUse, year(time, tzUse), month(time, tzUse), dayofmonth(time, tzUse), 0, 0) / 86400000)
+dayId   = dayBase + (isNY and nyh >= 17 ? 1 : 0)
+newDay  = na(dayId[1]) or dayId != dayId[1]
+
+var int firstDayId = na
+if na(firstDayId)
+    firstDayId := dayId
+skipDay = dayId == firstDayId   // prima zi din istoric are range incomplet
+
+// ═════════════════════════ CONVERSII / MARIME ═════════════════════════
+fx     = fxManual
+eqSym  = strategy.equity * fx
+stepQ  = qtyStepIn > 0 ? qtyStepIn : (syminfo.mincontract > 0 ? syminfo.mincontract : 0.01)
+ozLot  = ozPerLotIn > 0 ? ozPerLotIn : 100.0
+
+calcQty(float e, float s) =>
+    float q = 0.0
+    if sizeMode == "Fixed quantity"
+        q := fixedQty
+    else
+        dist   = math.abs(e - s)
+        budget = eqSym * riskPct / 100
+        byRisk = dist > 0 ? budget / (dist * syminfo.pointvalue) : 0.0
+        byLev  = e > 0 ? eqSym * maxLev / (e * syminfo.pointvalue) : 0.0
+        raw    = math.min(byRisk, byLev)
+        q := math.floor(raw / stepQ + 1e-9) * stepQ
+    q
+
+// ═════════════════════════ RANGE ═════════════════════════
+inRange = bh >= rangeStart and bh < rangeEnd
+
+var float rHigh = na
+var float rLow  = na
+var bool  tradedToday = false
+var bool  halted = false
+var float dayPeak = na
+
+if newDay
+    rHigh := na
+    rLow := na
+    tradedToday := false
+    halted := false
+    dayPeak := strategy.equity
+
+if inRange
+    rHigh := na(rHigh) ? high : math.max(rHigh, high)
+    rLow  := na(rLow) ? low : math.min(rLow, low)
+
+winNext   = not na(nbh) and nbh >= rangeEnd and nbh < closeHour
+rangeDone = not na(rHigh) and (not inRange or nbh >= rangeEnd)
+
+// ═════════════════════════ ALERT ENGINE ═════════════════════════
+fmt(float x)  => str.tostring(x, "#.##")
+fmt3(float x) => str.tostring(x, "#.###")
+
+build(string evt, string side, string reason, float px, float entry, float sl, float qty, string sec) =>
+    string out = ""
+    if alertsOn
+        string t = jsonOn ? (evt == "entry" ? (side == "long" ? tJLE : tJSE) : (side == "long" ? tJLX : tJSX))
+                          : (evt == "entry" ? (side == "long" ? tTLE : tTSE) : (side == "long" ? tTLX : tTSX))
+        string action = evt == "entry" ? (side == "long" ? "buy" : "sell") : (side == "long" ? "sell" : "buy")
+        float dist = math.abs(entry - sl)
+        float slP  = entry > 0 ? dist / entry * 100 : 0.0
+        float riskA = dist * qty * syminfo.pointvalue / fx
+        float riskP = strategy.equity > 0 ? riskA / strategy.equity * 100 : 0.0
+        string tid = syminfo.ticker + "-" + str.tostring(dayId)
+        out := t
+        out := str.replace_all(out, "{{ticker}}", syminfo.ticker)
+        out := str.replace_all(out, "{{tickerid}}", syminfo.tickerid)
+        out := str.replace_all(out, "{{exchange}}", syminfo.prefix)
+        out := str.replace_all(out, "{{interval}}", timeframe.period)
+        out := str.replace_all(out, "{{event}}", evt)
+        out := str.replace_all(out, "{{side}}", side)
+        out := str.replace_all(out, "{{action}}", action)
+        out := str.replace_all(out, "{{reason}}", reason)
+        out := str.replace_all(out, "{{price}}", fmt(px))
+        out := str.replace_all(out, "{{entry}}", fmt(entry))
+        out := str.replace_all(out, "{{sl}}", fmt(sl))
+        out := str.replace_all(out, "{{sl_pct}}", fmt(slP))
+        out := str.replace_all(out, "{{range_high}}", fmt(rHigh))
+        out := str.replace_all(out, "{{range_low}}", fmt(rLow))
+        out := str.replace_all(out, "{{qty}}", fmt3(qty))
+        out := str.replace_all(out, "{{oz}}", fmt3(qty))
+        out := str.replace_all(out, "{{lots}}", fmt3(qty / ozLot))
+        out := str.replace_all(out, "{{risk_usd}}", fmt(riskA))
+        out := str.replace_all(out, "{{risk_pct}}", fmt(riskP))
+        out := str.replace_all(out, "{{equity}}", fmt(strategy.equity))
+        out := str.replace_all(out, "{{trade_id}}", tid)
+        out := str.replace_all(out, "{{secret}}", sec)
+    out
+
+// ═════════════════════════ STARE POZITIE ═════════════════════════
+posOpened = strategy.position_size != 0 and nz(strategy.position_size[1]) == 0
+tradeClosedNow = strategy.closedtrades > nz(strategy.closedtrades[1])
+if posOpened or tradeClosedNow
+    tradedToday := true
+
+var float slLive = na
+var float tpLive = na
+var float qLive  = na
+var float entryLive = na
+if posOpened
+    fill = strategy.opentrades.entry_price(0)
+    isL  = strategy.position_size > 0
+    entryLive := fill
+    qLive := math.abs(strategy.position_size)
+    if slMode == "% of entry"
+        slLive := isL ? fill * (1 - slPct / 100) : fill * (1 + slPct / 100)   // re-ancorat o singura data la fill
+    else
+        slLive := isL ? rLow : rHigh
+    tpLive := tpOn ? (isL ? fill + (fill - slLive) * tpRR : fill - (slLive - fill) * tpRR) : na
+
+// ═════════════════════════ SL / TP BOXES ═════════════════════════
+var box   slBox = na
+var box   tpBox = na
+var float favExt = na      // cel mai favorabil pret atins de la intrare
+var float tpCap  = na
+var bool  tradeLong = false
+var line  slLine = na
+var line  pnlLine = na
+
+if showBoxes and posOpened
+    tradeLong := strategy.position_size > 0
+    favExt := entryLive
+    tpCap  := tpLive
+    slBox := box.new(bar_index, tradeLong ? entryLive : slLive, bar_index, tradeLong ? slLive : entryLive,
+         border_color=cSL, bgcolor=color.new(cSL, 80))
+    tpBox := box.new(bar_index, entryLive, bar_index, entryLive,
+         border_color=cTP, bgcolor=color.new(cTP, 80))
+    slLine  := line.new(bar_index, slLive, bar_index, slLive, color=cSL, width=2)
+    pnlLine := line.new(bar_index, entryLive, bar_index, entryLive, color=cTP, style=line.style_dotted, width=1)
+
+tradeActive = strategy.position_size != 0 or nz(strategy.position_size[1]) != 0
+if showBoxes and tradeActive and not na(tpBox) and not na(favExt)
+    // caseta verde urmareste pretul in directia profitului (plafonata la TP, daca e activ)
+    if tradeLong
+        favExt := math.max(favExt, high)
+    else
+        favExt := math.min(favExt, low)
+    if tpOn and not na(tpCap)
+        favExt := tradeLong ? math.min(favExt, tpCap) : math.max(favExt, tpCap)
+    box.set_top(tpBox, tradeLong ? favExt : entryLive)
+    box.set_bottom(tpBox, tradeLong ? entryLive : favExt)
+    box.set_right(tpBox, bar_index)   // se opreste la bara de iesire (SL / TP / final de sesiune)
+    if not na(slBox)
+        box.set_right(slBox, bar_index)
+    if not na(slLine)
+        line.set_x2(slLine, bar_index)
+    if not na(pnlLine)
+        float xp = strategy.position_size == 0 and strategy.closedtrades > 0 ? strategy.closedtrades.exit_price(strategy.closedtrades - 1) : close
+        line.set_xy2(pnlLine, bar_index, xp)
+        if strategy.position_size == 0 and strategy.closedtrades > 0
+            line.set_color(pnlLine, strategy.closedtrades.profit(strategy.closedtrades - 1) >= 0 ? cTP : cSL)
+
+// ═════════════════════════ EQUITY GUARD ═════════════════════════
+adverse = strategy.position_size > 0 ? close - low : strategy.position_size < 0 ? high - close : 0.0
+worstEq = strategy.equity - adverse * math.abs(strategy.position_size) * syminfo.pointvalue
+dd      = dayPeak > 0 ? (dayPeak - worstEq) / dayPeak * 100 : 0.0
+dayPeak := math.max(nz(dayPeak, strategy.equity), strategy.equity)
+
+guardHit = guardOn and not halted and dd >= guardLimit
+if guardHit
+    halted := true
+    strategy.cancel_all()
+    if strategy.position_size != 0
+        gSide = strategy.position_size > 0 ? "long" : "short"
+        strategy.close_all(comment="equity_guard",
+             alert_message=build("exit", gSide, "equity_guard", close, nz(entryLive, close), nz(slLive, close), math.abs(strategy.position_size), secret))
+
+// ═════════════════════════ ORDINE ═════════════════════════
+canPlace = winNext and rangeDone and not skipDay and strategy.position_size == 0
+           and not tradedToday and not halted and rHigh > rLow
+
+var float planQL = na
+var float planQS = na
+var float planSLL = na
+var float planSLS = na
+
+if canPlace
+    entryL = rHigh
+    entryS = rLow
+    planSLL := slMode == "% of entry" ? entryL * (1 - slPct / 100) : rLow
+    planSLS := slMode == "% of entry" ? entryS * (1 + slPct / 100) : rHigh
+    planQL  := calcQty(entryL, planSLL)
+    planQS  := calcQty(entryS, planSLS)
+    tpL = tpOn ? entryL + (entryL - planSLL) * tpRR : na
+    tpS = tpOn ? entryS - (planSLS - entryS) * tpRR : na
+
+    if planQL >= stepQ or (sizeMode == "Fixed quantity" and planQL > 0)
+        strategy.entry(idL, strategy.long, qty=planQL, stop=entryL,
+             oca_name="BO", oca_type=strategy.oca.cancel,
+             alert_message=build("entry", "long", "breakout", entryL, entryL, planSLL, planQL, secret))
+        strategy.exit("XL", idL, stop=planSLL, limit=tpL, comment_loss="SL", comment_profit="TP",
+             alert_loss=build("exit", "long", "sl", planSLL, entryL, planSLL, planQL, secret),
+             alert_profit=build("exit", "long", "tp", tpL, entryL, planSLL, planQL, secret))
+    else
+        strategy.cancel(idL)
+
+    if planQS >= stepQ or (sizeMode == "Fixed quantity" and planQS > 0)
+        strategy.entry(idS, strategy.short, qty=planQS, stop=entryS,
+             oca_name="BO", oca_type=strategy.oca.cancel,
+             alert_message=build("entry", "short", "breakout", entryS, entryS, planSLS, planQS, secret))
+        strategy.exit("XS", idS, stop=planSLS, limit=tpS, comment_loss="SL", comment_profit="TP",
+             alert_loss=build("exit", "short", "sl", planSLS, entryS, planSLS, planQS, secret),
+             alert_profit=build("exit", "short", "tp", tpS, entryS, planSLS, planQS, secret))
+    else
+        strategy.cancel(idS)
+else if strategy.position_size == 0
+    strategy.cancel(idL)
+    strategy.cancel(idS)
+
+// intretinere stop pentru pozitia deschisa
+if strategy.position_size > 0 and not guardHit
+    strategy.exit("XL", idL, stop=slLive, limit=tpLive, comment_loss="SL", comment_profit="TP",
+         alert_loss=build("exit", "long", "sl", slLive, entryLive, slLive, math.abs(strategy.position_size), secret),
+         alert_profit=build("exit", "long", "tp", tpLive, entryLive, slLive, math.abs(strategy.position_size), secret))
+if strategy.position_size < 0 and not guardHit
+    strategy.exit("XS", idS, stop=slLive, limit=tpLive, comment_loss="SL", comment_profit="TP",
+         alert_loss=build("exit", "short", "sl", slLive, entryLive, slLive, math.abs(strategy.position_size), secret),
+         alert_profit=build("exit", "short", "tp", tpLive, entryLive, slLive, math.abs(strategy.position_size), secret))
+
+// iesire la ora de inchidere (bara urmatoare se deschide la/dupa Close Hour)
+timeExit = strategy.position_size != 0 and not guardHit and not na(nbh) and (nbh >= closeHour or nbh < rangeEnd)
+if timeExit
+    tSide = strategy.position_size > 0 ? "long" : "short"
+    strategy.close_all(comment="Time exit " + str.format("{0,number,00}:00", closeHour),
+         alert_message=build("exit", tSide, "time", close, nz(entryLive, close), nz(slLive, close), math.abs(strategy.position_size), secret))
+
+if strategy.position_size == 0
+    slLive := na
+    tpLive := na
+
+// ═════════════════════════ PREVIEW IN PINE LOGS ═════════════════════════
+if previewOn and barstate.islast
+    float pe = nz(rHigh, close)
+    float ps = nz(rLow, close)
+    float sl1 = slMode == "% of entry" ? pe * (1 - slPct / 100) : ps
+    float sl2 = slMode == "% of entry" ? ps * (1 + slPct / 100) : pe
+    log.info("Long Entry:  " + build("entry", "long", "breakout", pe, pe, sl1, 1.0, "****"))
+    log.info("Short Entry: " + build("entry", "short", "breakout", ps, ps, sl2, 1.0, "****"))
+    log.info("Long Exit:   " + build("exit", "long", "sl", sl1, pe, sl1, 1.0, "****"))
+    log.info("Short Exit:  " + build("exit", "short", "sl", sl2, ps, sl2, 1.0, "****"))
+
+// ═════════════════════════ VIZUAL ═════════════════════════
+// caseta range + linii de nivel (stil strategie originala)
+var box  rBox = na
+var line hiLine = na
+var line loLine = na
+rangeStartBar = inRange and not inRange[1] and not skipDay
+
+if inRange and not skipDay and not na(rHigh)
+    if rangeStartBar or na(rBox)
+        rBox   := box.new(bar_index, rHigh, bar_index, rLow, border_color=cRange, bgcolor=color.new(cRange, 85))
+        hiLine := line.new(bar_index, rHigh, bar_index, rHigh, color=cRange, width=2)
+        loLine := line.new(bar_index, rLow, bar_index, rLow, color=cRange, width=2)
+    else
+        box.set_top(rBox, rHigh)
+        box.set_bottom(rBox, rLow)
+        box.set_right(rBox, bar_index)
+        line.set_xy1(hiLine, line.get_x1(hiLine), rHigh)
+        line.set_xy2(hiLine, bar_index, rHigh)
+        line.set_xy1(loLine, line.get_x1(loLine), rLow)
+        line.set_xy2(loLine, bar_index, rLow)
+
+// liniile de nivel se prelungesc pe toata fereastra de tranzactionare, pana la Close Hour
+if extendLines and not skipDay and not na(hiLine) and not inRange and bh >= rangeEnd and bh < closeHour
+    line.set_x2(hiLine, bar_index)
+    line.set_x2(loLine, bar_index)
+
+// ═════════════════════════ DASHBOARD ═════════════════════════
+var table dash = table.new(position.top_right, 2, 11, bgcolor=color.new(color.black, 15), border_width=1, border_color=color.new(color.gray, 60))
+
+row(int r, string k, string v) =>
+    table.cell(dash, 0, r, k, text_color=color.gray, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, r, v, text_color=color.white, text_size=size.small, text_halign=text.align_right)
+
+if barstate.islast and showDash
+    sig = halted ? "halted" : inRange ? "building range" : strategy.position_size > 0 ? "long" : strategy.position_size < 0 ? "short" : tradedToday ? "done for today" : rangeDone ? "wait breakout" : "-"
+    trend = na(rHigh) or inRange ? "-" : close > rHigh ? "above range" : close < rLow ? "below range" : "inside range"
+    nTr  = strategy.closedtrades
+    wr   = nTr > 0 ? strategy.wintrades / nTr * 100 : 0.0
+    pf   = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : na
+    row(0, "Signal", sig)
+    row(1, "Trend", trend)
+    row(2, "Session (broker)", str.format("{0,number,00}:00-{1,number,00}:00", rangeStart, closeHour))
+    row(3, "Range", na(rHigh) ? "-" : fmt(rLow) + " - " + fmt(rHigh))
+    row(4, "Plan Long (SL / qty)", na(planQL) ? "-" : fmt(planSLL) + " / " + fmt3(planQL))
+    row(5, "Plan Short (SL / qty)", na(planQS) ? "-" : fmt(planSLS) + " / " + fmt3(planQS))
+    row(6, "Trades", str.tostring(nTr))
+    row(7, "Win rate", fmt(wr) + "%")
+    row(8, "Profit factor", na(pf) ? "-" : fmt(pf))
+    row(9, "Net profit", fmt(strategy.netprofit))
+    row(10, "Day DD (est.)", fmt(dd) + "%")
